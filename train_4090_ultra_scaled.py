@@ -60,6 +60,51 @@ from models.ultra_unified_model import RevolutionaryGPT4oController
 from real_tsplib_data_loader import RevolutionaryTSPLIBLoader
 
 
+def robust_json_parse(response_text: str) -> dict:
+    """Robustly extract JSON from GPT-4o responses that may contain extra text"""
+    import json
+    import re
+    
+    if not response_text or not response_text.strip():
+        return {}
+    
+    # Try direct JSON parsing first
+    try:
+        return json.loads(response_text.strip())
+    except:
+        pass
+    
+    # Try to find JSON block in the response
+    json_patterns = [
+        r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}',  # Find outermost JSON object
+        r'```json\n(.*?)\n```',               # Code block JSON
+        r'```\n(.*?)\n```',                   # Generic code block
+        r'\{.*\}',                            # Simple curly brace match
+    ]
+    
+    for pattern in json_patterns:
+        matches = re.findall(pattern, response_text, re.DOTALL | re.MULTILINE)
+        for match in matches:
+            try:
+                cleaned = match.strip()
+                return json.loads(cleaned)
+            except:
+                continue
+    
+    # Try line by line for JSON objects
+    lines = response_text.split('\n')
+    for line in lines:
+        line = line.strip()
+        if line.startswith('{') and line.endswith('}'):
+            try:
+                return json.loads(line)
+            except:
+                continue
+    
+    print(f"⚠️  Could not parse JSON from response: '{response_text[:200]}...'")
+    return {}
+
+
 class GPT4oTeacher:
     """🧠 GPT-4o Teacher that guides GNN learning - INTEGRATED INTO EXISTING SYSTEM"""
     
@@ -113,7 +158,7 @@ Focus on teaching the GNN HOW to think about optimization, not just what the ans
                 temperature=0.3
             )
             
-            hints = json.loads(response.choices[0].message.content)
+            hints = robust_json_parse(response.choices[0].message.content)
             return hints
         except Exception as e:
             print(f"⚠️  GPT-4o hint generation failed: {e}")
@@ -163,7 +208,7 @@ Curriculum Rules:
                 temperature=0.2
             )
             
-            decision = json.loads(response.choices[0].message.content)
+            decision = robust_json_parse(response.choices[0].message.content)
             return decision
         except Exception as e:
             print(f"⚠️  GPT-4o curriculum analysis failed: {e}")
@@ -213,7 +258,7 @@ Suggest architectural improvements in JSON:
                 temperature=0.3
             )
             
-            suggestions = json.loads(response.choices[0].message.content)
+            suggestions = robust_json_parse(response.choices[0].message.content)
             return suggestions
         except Exception as e:
             print(f"⚠️  GPT-4o architecture suggestions failed: {e}")
@@ -835,11 +880,11 @@ class Ultra4090TensorBoardLogger:
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         memory_gb = total_params * 4 / 1e9
         
-        # Ultra-detailed component analysis
-        llm_params = sum(p.numel() for p in model.llm.parameters())
-        gnn_params = sum(p.numel() for p in model.gnn.parameters())
-        interface_params = sum(p.numel() for p in model.interfaces.parameters())
-        pred_params = sum(p.numel() for p in model.pred_head.parameters())
+        # Ultra-detailed component analysis - FIXED ATTRIBUTE NAMES
+        llm_params = sum(p.numel() for p in model.gpt4o_controller.parameters())
+        gnn_params = sum(p.numel() for p in model.ultra_gnn.parameters())
+        interface_params = sum(p.numel() for p in model.control_interface.parameters())
+        pred_params = sum(p.numel() for p in model.prediction_head.parameters())
         
         analysis = f"""
 # 🔥 ULTRA-SCALED Model Analysis

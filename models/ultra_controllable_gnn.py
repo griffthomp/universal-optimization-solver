@@ -99,7 +99,8 @@ class HierarchicalMemoryModule(nn.Module):
         
         # Update memory with new information
         memory_input = torch.mean(x, dim=1, keepdim=True)  # [B, 1, D]
-        updated_memory, _ = memory_module(memory_input, memory_state.transpose(0, 1).contiguous())
+        memory_state_for_gru = memory_state.mean(dim=1, keepdim=True).transpose(0, 1)  # [1, B, D]
+        updated_memory, _ = memory_module(memory_input, memory_state_for_gru)
         updated_memory = updated_memory.transpose(0, 1)  # [B, M, D]
         
         # Compute update gate
@@ -109,11 +110,14 @@ class HierarchicalMemoryModule(nn.Module):
         # Apply gated update
         updated_x = gate * attended_memory + (1 - gate) * x
         
-        # Update stored memory state
+        # Update stored memory state - Fix: Handle batch vs memory dimension mismatch
+        batch_aggregated = updated_memory.mean(dim=1, keepdim=True)  # [1, 1, D]
+        memory_update = batch_aggregated.expand(-1, self.memory_size, -1)  # [1, M, D]
+        
         if level == 'local':
-            self.local_memory_state.copy_(updated_memory[0:1])
+            self.local_memory_state.copy_(memory_update)
         else:
-            self.global_memory_state.copy_(updated_memory[0:1])
+            self.global_memory_state.copy_(memory_update)
         
         return updated_x, updated_memory
 
@@ -551,7 +555,7 @@ class EnhancedGraphTransformerLayer(nn.Module):
         
         # === UPGRADE 4: CROSS-MODAL ATTENTION COMPONENTS ===
         self.cross_modal_attention = CrossModalAttention(
-            gnn_dim=hidden_dim, llm_dim=1536, hidden_dim=hidden_dim//2
+            gnn_dim=hidden_dim, llm_dim=1536, hidden_dim=hidden_dim
         )
         
         self.dropout = nn.Dropout(dropout)
@@ -829,7 +833,7 @@ class UltraControllableGNN(nn.Module):
         
         # GPT-4o control interface (enhanced)
         self.control_interface = nn.ModuleDict({
-            'attention_guidance_encoder': nn.Linear(1024, hidden_dim),  # From GPT-4o embeddings
+            'attention_guidance_encoder': nn.Linear(2048, hidden_dim),  # From GPT-4o control interface
             'layer_specific_control': nn.ModuleList([
                 nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)
             ])

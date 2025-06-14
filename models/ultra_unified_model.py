@@ -47,7 +47,7 @@ class RevolutionaryGPT4oController(nn.Module):
         
         # Enhanced projection for revolutionary control
         self.strategic_projection = nn.Sequential(
-            nn.Linear(1536, output_dim),  # GPT-4o embedding is 1536-dim
+            nn.Linear(3072, output_dim),  # text-embedding-3-large is 3072-dim
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(output_dim, output_dim),
