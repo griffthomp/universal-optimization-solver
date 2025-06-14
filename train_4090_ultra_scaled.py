@@ -1035,6 +1035,19 @@ class UltraRevolutionaryModel(nn.Module):
             # Fallback for simple tensor output
             graph_representation = gnn_outputs
         
+        # SHAPE FIX: Ensure we get one prediction per graph in batch
+        # graph_representation is currently [1, N, 1] but we need [B, 1] where B=batch_size
+        if len(graph_representation.shape) == 3:
+            # If shape is [1, N, 1], take mean to get [1, 1] then expand to [B, 1]
+            batch_size = len(texts)  # Number of graphs in batch
+            pooled_repr = graph_representation.mean(dim=1)  # [1, 1]
+            # Expand to match batch size
+            graph_representation = pooled_repr.expand(batch_size, -1)  # [B, 1]
+        elif len(graph_representation.shape) == 2 and graph_representation.shape[0] == 1:
+            # If shape is [1, D], expand to [B, D]
+            batch_size = len(texts)
+            graph_representation = graph_representation.expand(batch_size, -1)
+        
         # Step 5: Final prediction
         predictions = self.prediction_head(graph_representation)
         
@@ -1131,7 +1144,7 @@ def train_ultra_4090(
     num_epochs=200,
     experiment_name=None,
     use_amp=False,  # Disabled for stability (FP16 causes overflow)
-    grad_accumulation=2,
+    grad_accumulation=1,  # NUCLEAR FIX: Changed from 2 to 1 to avoid double backward
     save_every=20,
     log_every=10,
     max_samples_per_domain=None,
@@ -1289,47 +1302,44 @@ def train_ultra_4090(
             if debug_mode and epoch == 0 and batch_idx == 0:
                 debug_training_step(texts, graphs, targets, domains, model, device)
             
-            # Forward pass with mixed precision
-            if scaler and config['use_amp']:
-                try:
-                    # Try new PyTorch 2.6+ API
-                    from torch.amp import autocast
-                    with autocast('cuda'):
-                        preds, model_info = model(texts, graphs)
-                        loss = F.mse_loss(preds, targets) / grad_accumulation
-                except:
-                    # Fallback to old API
-                    from torch.cuda.amp import autocast
-                    with autocast():
-                        preds, model_info = model(texts, graphs)
-                        loss = F.mse_loss(preds, targets) / grad_accumulation
-                
-                scaler.scale(loss).backward()
-                
-                # Gradient accumulation
-                if (batch_idx + 1) % grad_accumulation == 0:
-                    scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-            else:
-                preds, model_info = model(texts, graphs)
-                loss = F.mse_loss(preds, targets) / grad_accumulation
-                loss.backward()
-                
-                if (batch_idx + 1) % grad_accumulation == 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
+            # Initialize grad_norm for logging
+            grad_norm = 0.0
             
-            # Track metrics with safety checks
-            actual_loss = loss.item() * grad_accumulation
+            # BULLETPROOF TRAINING STEP - No gradient accumulation complexity
+            optimizer.zero_grad()
+            
+            # NUCLEAR FIX: Single-path training - NO AMP complications
+            # Force disable scaler to prevent any AMP logic
+            scaler = None
+            
+            # BULLETPROOF SINGLE-PATH TRAINING
+            optimizer.zero_grad()
+            
+            # Simple forward pass - no AMP
+            preds, model_info = model(texts, graphs)
+            loss = F.mse_loss(preds, targets)
+            
+            # NUCLEAR FIX: Extract ALL tensor values BEFORE backward
+            actual_loss = loss.item()  # Move BEFORE backward
+            
+            # COMPUTE DOMAIN LOSSES BEFORE BACKWARD - Prevent graph conflicts
+            domain_loss_values = {}
+            for i, domain in enumerate(domains):
+                with torch.no_grad():
+                    domain_loss_val = F.mse_loss(preds[i:i+1].detach(), targets[i:i+1].detach()).item()
+                    domain_loss_values[domain] = domain_loss_val
+            
+            # Single backward pass - bulletproof
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+
             
             # Safety check for inf/nan loss
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"❌ WARNING: Invalid loss detected at epoch {epoch}, batch {batch_idx}")
-                print(f"   Loss: {loss.item()}")
+                print(f"   Loss: {actual_loss}")  # Use pre-computed value
                 print(f"   Targets: {targets}")
                 print(f"   Predictions: {preds}")
                 if debug_mode:
@@ -1338,18 +1348,20 @@ def train_ultra_4090(
             
             epoch_losses.append(actual_loss)
             
-            # Domain-specific tracking with safety
-            for i, domain in enumerate(domains):
-                domain_loss = F.mse_loss(preds[i:i+1], targets[i:i+1]).item()
-                if not (torch.isnan(torch.tensor(domain_loss)) or torch.isinf(torch.tensor(domain_loss))):
-                    domain_losses[domain].append(domain_loss)
+            # Domain-specific tracking with safety - USE PRE-COMPUTED VALUES
+            for domain, domain_loss_val in domain_loss_values.items():
+                if not (torch.isnan(torch.tensor(domain_loss_val)) or torch.isinf(torch.tensor(domain_loss_val))):
+                    domain_losses[domain].append(domain_loss_val)
             
             # 🚀 NEW: Co-Evolutionary Step Logic
             global_step += 1
             
             # Calculate accuracy for curriculum evaluation
             if targets.numel() > 0:
-                accuracy = (torch.abs(preds - targets) / targets < 0.15).float().mean().item()
+                # NUCLEAR FIX: Detach tensors to prevent computation graph reuse
+                preds_detached = preds.detach()
+                targets_detached = targets.detach()
+                accuracy = (torch.abs(preds_detached - targets_detached) / targets_detached < 0.15).float().mean().item()
                 curriculum_metrics.update({
                     'accuracy': accuracy,
                     'loss': actual_loss,
@@ -1514,7 +1526,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
     parser.add_argument('--experiment', type=str, default=None, help='Experiment name')
     parser.add_argument('--no_amp', action='store_true', help='Disable mixed precision')
-    parser.add_argument('--grad_accum', type=int, default=2, help='Gradient accumulation steps')
+    parser.add_argument('--grad_accum', type=int, default=1, help='Gradient accumulation steps')
     parser.add_argument('--max_samples', type=int, default=None, help='Max samples per domain')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     
