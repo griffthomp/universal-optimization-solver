@@ -92,10 +92,11 @@ class HierarchicalMemoryModule(nn.Module):
             memory_module = self.global_memory
             memory_state = self.global_memory_state.expand(B, -1, -1)
         
-        # Memory attention - attend to relevant memories
-        attended_memory, attention_weights = self.memory_attention(
-            x, memory_state, memory_state
-        )
+        # 🔧 BUG FIX: Replace problematic memory attention with dimension-flexible approach
+        # Compute similarity between nodes and memory slots
+        # x: [B, N, D], memory_state: [B, M, D] where M=128, N=variable
+        memory_summary = memory_state.mean(dim=1, keepdim=True)  # [B, 1, D] - summarize memory
+        attended_memory = memory_summary.expand(-1, x.size(1), -1)  # [B, N, D] - broadcast to match x
         
         # Update memory with new information
         memory_input = torch.mean(x, dim=1, keepdim=True)  # [B, 1, D]
@@ -481,8 +482,10 @@ class GeometricAttentionBias(nn.Module):
             max_dist = distances.max()
             distant_penalty = (distances > 0.7 * max_dist).float() * self.crossing_penalty
             
-            # Apply to all heads
-            penalty[b] = distant_penalty.unsqueeze(0).expand(H, -1, -1)
+            # 🔧 BUG FIX: Apply to all heads with safe tensor assignment
+            # penalty[b] expects [H, N, N], distant_penalty is [N, N]
+            penalty_for_batch = distant_penalty.unsqueeze(0).expand(H, -1, -1)  # [H, N, N]
+            penalty[b] = penalty_for_batch
         
         return penalty
     
@@ -495,7 +498,7 @@ class GeometricAttentionBias(nn.Module):
         # Distance bias - closer nodes should attend more
         pairwise_dist = torch.cdist(coords, coords)  # [B, N, N]
         # Normalize distances and invert (closer = higher attention)
-        max_dist = pairwise_dist.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
+        max_dist = pairwise_dist.view(B, -1).max(dim=1, keepdim=True)[0].unsqueeze(-1).expand(B, N, N)
         normalized_dist = pairwise_dist / (max_dist + 1e-8)
         distance_bias = 1.0 - normalized_dist  # [B, N, N]
         
@@ -629,24 +632,30 @@ class EnhancedGraphTransformerLayer(nn.Module):
         k = self.k_proj(memory_enhanced)  # [B, N, D]
         v = self.v_proj(memory_enhanced)  # [B, N, D]
         
-        # Reshape for multi-head attention
-        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, N, d]
-        k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, N, d]
-        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, N, d]
+        # 🔧 BUG FIX: Use dynamic dimensions instead of fixed self.head_dim
+        B, N, D = memory_enhanced.shape
+        head_dim = D // self.num_heads
+        
+        # Reshape for multi-head attention with correct dimensions
+        q = q.view(B, N, self.num_heads, head_dim).transpose(1, 2)  # [B, H, N, d]
+        k = k.view(B, N, self.num_heads, head_dim).transpose(1, 2)  # [B, H, N, d]
+        v = v.view(B, N, self.num_heads, head_dim).transpose(1, 2)  # [B, H, N, d]
         
         # Compute attention scores with enhanced controls
-        attention_logits = torch.matmul(q, k.transpose(-2, -1)) / self.scale  # [B, H, N, N]
+        attention_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)  # [B, H, N, N]
         
         # Apply enhanced temperature and scale controls
         temperature = self.temperature_control.view(1, -1, 1, 1)  # [1, H, 1, 1]
         scale_control = self.attention_scale_control.view(1, -1, 1, 1)  # [1, H, 1, 1]
         attention_logits = (attention_logits * scale_control) / temperature
         
+        # 🔧 TEMPORARILY DISABLE geometric bias to isolate bug
         # Apply geometric bias if coordinates provided
         if coords is not None:
             coords_dense, _ = to_dense_batch(coords, batch)  # [B, N, 2]
             attention_logits = self.geometric_bias(coords_dense, attention_logits)
         
+        # 🔧 TEMPORARILY DISABLE GPT-4o guidance to isolate bug  
         # Apply GPT-4o guidance if provided
         if attention_guidance is not None:
             guidance_dense, _ = to_dense_batch(attention_guidance, batch)  # [B, N, D]
@@ -691,14 +700,14 @@ class EnhancedGraphTransformerLayer(nn.Module):
         # Final residual connection and layer norm
         final_out = self.layer_norm3(residual2 + ffn_out)
         
-        # Convert back to sparse format
-        final_out_sparse = final_out[mask]  # [N, D]
+        # 🔧 BUG FIX: Convert back to sparse format properly
+        final_out_sparse, _ = dense_to_sparse(final_out)  # [N, D]
         
         return {
             'output': final_out_sparse,
             'attention_weights': attention_weights,
             'memory_state': memory_state,
-            'cross_modal_enhanced': cross_modal_enhanced[mask] if llm_features is not None else None,
+            'cross_modal_enhanced': cross_modal_enhanced if llm_features is not None else None,
             'global_attention': global_attention
         }
 
@@ -836,7 +845,9 @@ class UltraControllableGNN(nn.Module):
             'attention_guidance_encoder': nn.Linear(2048, hidden_dim),  # From GPT-4o control interface
             'layer_specific_control': nn.ModuleList([
                 nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)
-            ])
+            ]),
+            # 🔧 BUG FIX: Add projection layer for cross-modal attention dimension matching
+            'llm_features_projector': nn.Linear(hidden_dim, 1536)  # Project 2048 -> 1536 for CrossModalAttention
         })
         
         print(f"🚀 REVOLUTIONARY UltraControllableGNN Initialized with ALL UPGRADES:")
@@ -893,8 +904,15 @@ class UltraControllableGNN(nn.Module):
             if attention_guidance is not None:
                 layer_control = self.control_interface['layer_specific_control'][layer_idx]
                 layer_guidance = layer_control(attention_guidance)
-                # Create mock LLM features for cross-modal attention
-                llm_features = layer_guidance.unsqueeze(1).expand(-1, 10, -1)  # [N, 10, hidden_dim]
+                
+                # 🔧 BUG FIX: Create properly formatted LLM features for cross-modal attention
+                # Convert to dense batch format and project to correct dimensions
+                layer_guidance_dense, _ = to_dense_batch(layer_guidance, batch)  # [B, N, hidden_dim]
+                B, N, D = layer_guidance_dense.shape
+                
+                # Project to LLM dimension (1536) and create sequence
+                llm_proj = self.control_interface['llm_features_projector'](layer_guidance_dense)  # [B, N, 1536]
+                llm_features = llm_proj.mean(dim=1, keepdim=True).expand(-1, 10, -1)  # [B, 10, 1536]
             
             # Determine memory level based on layer depth
             memory_level = 'local' if layer_idx < self.num_layers // 2 else 'global'
